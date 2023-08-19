@@ -42,15 +42,14 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return torch.polar(torch.ones_like(freqs), freqs)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    shape = [d if i in [1, ndim - 1] else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
 
@@ -173,8 +172,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, freqs_cis):
         h = x + self.attention.forward(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out
+        return h + self.feed_forward.forward(self.ffn_norm(h))
 
 
 class Transformer(nn.Module):
@@ -235,7 +233,7 @@ class Transformer(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = dict(self.named_parameters())
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
@@ -253,7 +251,7 @@ class Transformer(nn.Module):
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
+        extra_args = dict(fused=True) if use_fused else {}
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
@@ -272,8 +270,7 @@ class Transformer(nn.Module):
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
+        return flops_achieved / flops_promised
     
     @torch.inference_mode()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -309,52 +306,49 @@ class Transformer(nn.Module):
 
     def export(self, filepath='model.bin'):
         """export the model weights in fp32 into .bin file to be read from C"""
-        f = open(filepath, 'wb')
+        with open(filepath, 'wb') as f:
+            def serialize(t):
+                d = t.detach().cpu().view(-1).numpy().astype(np.float32)
+                b = struct.pack(f'{len(d)}f', *d)
+                f.write(b)
 
-        def serialize(t):
-            d = t.detach().cpu().view(-1).numpy().astype(np.float32)
-            b = struct.pack(f'{len(d)}f', *d)
-            f.write(b)
+            # first write out the header
+            hidden_dim = self.layers[0].feed_forward.w1.weight.shape[0]
+            p = self.params
+            n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+            header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads, 
+                                           n_kv_heads, p.vocab_size, p.max_seq_len)
+            f.write(header)
 
-        # first write out the header
-        hidden_dim = self.layers[0].feed_forward.w1.weight.shape[0]
-        p = self.params
-        n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
-        header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads, 
-                                       n_kv_heads, p.vocab_size, p.max_seq_len)
-        f.write(header)
+            # next write out the embedding weights
+            serialize(self.tok_embeddings.weight)
 
-        # next write out the embedding weights
-        serialize(self.tok_embeddings.weight)
-        
-        # now all the layers
-        # attention weights
-        for layer in self.layers:
-            serialize(layer.attention_norm.weight)
-        for layer in self.layers:
-            serialize(layer.attention.wq.weight)
-        for layer in self.layers:
-            serialize(layer.attention.wk.weight)
-        for layer in self.layers:
-            serialize(layer.attention.wv.weight)
-        for layer in self.layers:
-            serialize(layer.attention.wo.weight)
-        # ffn weights
-        for layer in self.layers:
-            serialize(layer.ffn_norm.weight)
-        for layer in self.layers:
-            serialize(layer.feed_forward.w1.weight)
-        for layer in self.layers:
-            serialize(layer.feed_forward.w2.weight)
-        for layer in self.layers:
-            serialize(layer.feed_forward.w3.weight)
-        # final rmsnorm
-        serialize(self.norm.weight)
-        # note: no need to write final classifier weights due to weight sharing
-        # freqs_cis
-        serialize(self.freqs_cis.real[:p.max_seq_len])
-        serialize(self.freqs_cis.imag[:p.max_seq_len])
+            # now all the layers
+            # attention weights
+            for layer in self.layers:
+                serialize(layer.attention_norm.weight)
+            for layer in self.layers:
+                serialize(layer.attention.wq.weight)
+            for layer in self.layers:
+                serialize(layer.attention.wk.weight)
+            for layer in self.layers:
+                serialize(layer.attention.wv.weight)
+            for layer in self.layers:
+                serialize(layer.attention.wo.weight)
+            # ffn weights
+            for layer in self.layers:
+                serialize(layer.ffn_norm.weight)
+            for layer in self.layers:
+                serialize(layer.feed_forward.w1.weight)
+            for layer in self.layers:
+                serialize(layer.feed_forward.w2.weight)
+            for layer in self.layers:
+                serialize(layer.feed_forward.w3.weight)
+            # final rmsnorm
+            serialize(self.norm.weight)
+            # note: no need to write final classifier weights due to weight sharing
+            # freqs_cis
+            serialize(self.freqs_cis.real[:p.max_seq_len])
+            serialize(self.freqs_cis.imag[:p.max_seq_len])
 
-        # write to binary file
-        f.close()
         print(f"wrote {filepath}")
